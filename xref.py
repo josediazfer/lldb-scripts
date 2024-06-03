@@ -26,12 +26,31 @@ def get_addr_bytes(target, addr):
     return addr_bytes
 """
 
+def get_pc_reg_name(debugger):
+    interpreter = debugger.GetCommandInterpreter()
+    rto = lldb.SBCommandReturnObject()
+    interpreter.HandleCommand("reg read pc", rto)
+    if not rto.Succeeded() or not rto.GetOutput():
+      raise Exception("failed to read the program counter register")
+    matches = re.search('([a-zA-Z0-9]+)\s*=\s*0x', rto.GetOutput())
+    if not matches:
+      raise Exception("failed to read the program counter register")
+
+    return matches.group(1)
+
+
+def get_addr_from_expression(target, expression):
+    value = target.EvaluateExpression(expression)
+
+    return value.GetValueAsUnsigned()
+
 def xrefs_in_region(target, addr, refs, region_info):
     start = region_info.GetRegionBase()
     end = region_info.GetRegionEnd()
     addr_size = target.GetAddressByteSize()
     process = target.GetProcess()
     error = lldb.SBError()
+    refs_count = len(refs)
     while start + addr_size <= end:
         ptr = process.ReadPointerFromMemory(start, error)
         if error.Success():
@@ -47,8 +66,10 @@ def xrefs_in_region(target, addr, refs, region_info):
         start = region_info.GetRegionBase()
         xrefs_from_ins(target, addr, start, end, refs)
 
+    return len(refs) - refs_count
+
 def resolve_ins_ref_addr(target, base_addr, ins):
-    matches = re.search('\*(?P<pc>[+-]?0x[0-9a-f]+)\(%rip\)', ins.GetOperands(target))
+    matches = re.search('\*(?P<pc>[+-]?0x[0-9a-f]+)\(%' + pc_reg_name + '\)', ins.GetOperands(target))
     if matches == None:
         return None
 
@@ -59,7 +80,7 @@ def resolve_branch_ref_addr(target, base_addr, ins):
     process = target.GetProcess()
     # relative, indirect call/jump
     # 0x500|*-0x500(%rip)
-    matches = re.search('(?P<imm>[+-]?0x[0-9a-f]+)|\*(?P<pc>[+-]?0x[0-9a-f]+)\(%rip\)', ins.GetOperands(target))
+    matches = re.search('(?P<imm>[+-]?0x[0-9a-f]+)|\*(?P<pc>[+-]?0x[0-9a-f]+)\(%' + pc_reg_name + '\)', ins.GetOperands(target))
     if matches == None:
         return None
     if matches.group('pc'):
@@ -102,9 +123,18 @@ def xrefs_from_ins(target, addr, start, end, refs):
 
             start += ins.GetByteSize()
 def handle_command(debugger, command, exe_ctx, result, internal_dict):
+    global pc_reg_name
+
+    max_region_size = 10*1024*1024
     command_args = shlex.split(command, posix=False)
-    usage = "usage: %prog [options] address"
-    parser = optparse.OptionParser(usage=usage, prog="xref")
+    usage = "usage: xref [options] address/expression"
+    parser = optparse.OptionParser(usage=usage)
+    parser.add_option("-e", "--expression",
+                  action="store", dest="expression",
+                  help="evaluate expression for get an memory address")
+    parser.add_option("-m", "--max-region-size",
+                  action="store", dest="max_region_size",
+                  help="search in the memory region with a max size")
     target = exe_ctx.target 
     process = target.GetProcess()
     try:
@@ -115,15 +145,24 @@ def handle_command(debugger, command, exe_ctx, result, internal_dict):
     if not process.is_alive:
         result.SetError("process not exist")
         return
-    try:
-        addr = int(args[0], 16)
-    except:
-        addr = int(args[0])
+    if options.expression:
+        addr = get_addr_from_expression(target, options.expression)
+    else:
+        try:
+            addr = int(args[0], 16)
+        except:
+            addr = int(args[0])
     regions = process.GetMemoryRegions()
     refs = []
+    pc_reg_name = get_pc_reg_name(debugger)
+    if options.max_region_size:
+        max_region_size = int(options.max_region_size, 0)
+    print("Searching external references to 0x%x" % addr)
     for i in range(regions.GetSize()):
         region_info = lldb.SBMemoryRegionInfo()
         regions.GetMemoryRegionAtIndex(i, region_info)
+        if (region_info.GetRegionEnd() - region_info.GetRegionBase()) > max_region_size:
+            continue
         if region_info.IsReadable():
             region_perms = "r"
         else:
@@ -138,9 +177,11 @@ def handle_command(debugger, command, exe_ctx, result, internal_dict):
         else:
             region_perms += "-"
         print("Searching in the memory region [0x%x-0x%x %s]" % (region_info.GetRegionBase(), region_info.GetRegionEnd(), region_perms))
-        xrefs_in_region(target, addr, refs, region_info)
-      
-    print("%d references found it of 0x%x" % (len(refs), addr))
+        refs_count = xrefs_in_region(target, addr, refs, region_info)
+        if refs_count > 0:
+            print("\t* %d references found it" % refs_count)
+
+    print("%d references count" % len(refs))
     for ref in refs:
         resol_addr = target.ResolveLoadAddress(ref)
         print("\t* 0x%x %s" % (ref, resol_addr.section))
