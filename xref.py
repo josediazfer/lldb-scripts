@@ -55,7 +55,7 @@ def xrefs_in_region(target, addr, refs, region_info):
         ptr = process.ReadPointerFromMemory(start, error)
         if error.Success():
             if ptr == addr:
-                refs.append(start)
+                refs.add(start)
                 start += addr_size
             else:
                 start += 1
@@ -68,12 +68,10 @@ def xrefs_in_region(target, addr, refs, region_info):
 
     return len(refs) - refs_count
 
-def resolve_ins_ref_addr(target, base_addr, ins):
-    matches = re.search('\*(?P<pc>[+-]?0x[0-9a-f]+)\(%' + pc_reg_name + '\)', ins.GetOperands(target))
-    if matches == None:
-        return None
+def resolve_ins_ref_addr(target, addr, base_addr, ins):
+    matches = re.search('(?P<pc>[+-]?0x[0-9a-f]+)\(%' + pc_reg_name + '\)', ins.GetOperands(target))
 
-    return (ins.GetAddress().GetLoadAddress(target) + ins.GetByteSize()) + int(matches.group('pc'), 0)
+    return (ins.GetAddress().GetLoadAddress(target) + ins.GetByteSize()) + int(matches.group('pc'), 0) if matches else None
 
 def resolve_branch_ref_addr(target, base_addr, ins):
     resolved_addr = None
@@ -84,14 +82,15 @@ def resolve_branch_ref_addr(target, base_addr, ins):
     if matches == None:
         return None
     if matches.group('pc'):
-            # next pc + offset 
-            addr_indirect = (ins.GetAddress().GetLoadAddress(target) + ins.GetByteSize()) + int(matches.group('pc'), 0)
-            error = lldb.SBError()
-            addr_indirect = process.ReadPointerFromMemory(addr_indirect, error)
-            if error.Success():
-                resolved_addr = addr_indirect
+        # next pc + offset
+        addr_indirect = (ins.GetAddress().GetLoadAddress(target) + ins.GetByteSize()) + int(matches.group('pc'), 0)
+        error = lldb.SBError()
+        addr_indirect = process.ReadPointerFromMemory(addr_indirect, error)
+        if error.Success():
+            resolved_addr = addr_indirect
     else:
-        resolved_addr = base_addr + int(matches.group('imm'), 0)
+        #resolved_addr = base_addr + int(matches.group('imm'), 0)
+        resolved_addr = int(matches.group('imm'), 0)
 
     """ print ins
     if resolved_addr != None:
@@ -100,11 +99,33 @@ def resolve_branch_ref_addr(target, base_addr, ins):
     return resolved_addr
 
 def xrefs_from_ins(target, addr, start, end, refs):
-    while start < end: 
-        dis_addr = target.ResolveLoadAddress(start)
-        ins_dis = target.ReadInstructions(dis_addr, 1024)
-        base_addr = None
+    sections_region = []
+    module = target.ResolveLoadAddress(start).GetModule()
+    for section in module.section_iter():
+        load_addr = section.GetLoadAddress(target)
+        if load_addr >= start and load_addr < end:
+            if section.GetNumSubSections() > 0:
+                for subsection in section:
+                    if subsection.GetSectionType() == lldb.eSectionTypeCode:
+                        sections_region.append(subsection)
+            else:
+                sections_region.append(section)
+    sections_region.sort(key=lambda section : section.GetLoadAddress(target))
+    """ for section in sections_region:
+        print("section %s %x %d" % (section.GetName(), section.GetLoadAddress(target), section.GetByteSize()))
+    """
+    section_idx = 0
+    if len(sections_region) > 0:
+        section = sections_region[0]
+        section_start_addr = section.GetLoadAddress(target)
+        section_end_addr = section_start_addr + section.GetByteSize()
+        section_idx = 0
 
+    section_current = None
+    base_addr = None
+    dis_addr = target.ResolveLoadAddress(start)
+    ins_dis = target.ReadInstructions(dis_addr, 1024)
+    while start < end: 
         if ins_dis.GetSize() <= 0:
             start += 1
             continue
@@ -116,12 +137,29 @@ def xrefs_from_ins(target, addr, start, end, refs):
             if ins.DoesBranch() and ins.GetOperands(target) != "":
                 ref_addr = resolve_branch_ref_addr(target, base_addr, ins)
             else:
-                ref_addr = resolve_ins_ref_addr(target, base_addr, ins)
+                ref_addr = resolve_ins_ref_addr(target, start, base_addr, ins)
 
             if ref_addr == addr:
-                refs.append(start)
+                refs.add(start)
 
             start += ins.GetByteSize()
+            if section_idx < len(sections_region):
+                if start > section_start_addr and not section_current:
+                    start = section_start_addr
+                    section_current = section
+                    dis_addr = target.ResolveLoadAddress(start)
+                    ins_dis = target.ReadInstructions(dis_addr, 1024)
+                    #print("Start at %x %x" % (start, section_end_addr))
+                    break
+
+                if start > section_end_addr:
+                    section_idx += 1
+                    section_current = None
+                    if section_idx < len(sections_region):
+                        section = sections_region[section_idx]
+                        section_start_addr = section.GetLoadAddress(target)
+                        section_end_addr = section_start_addr + section.GetByteSize()
+
 def handle_command(debugger, command, exe_ctx, result, internal_dict):
     global pc_reg_name
 
@@ -153,7 +191,7 @@ def handle_command(debugger, command, exe_ctx, result, internal_dict):
         except:
             addr = int(args[0])
     regions = process.GetMemoryRegions()
-    refs = []
+    refs = set()
     pc_reg_name = get_pc_reg_name(debugger)
     if options.max_region_size:
         max_region_size = int(options.max_region_size, 0)
@@ -181,6 +219,8 @@ def handle_command(debugger, command, exe_ctx, result, internal_dict):
         if refs_count > 0:
             print("\t* %d references found it" % refs_count)
 
+    refs = list(refs)
+    refs.sort(key=lambda e : e)
     print("%d references count" % len(refs))
     for ref in refs:
         resol_addr = target.ResolveLoadAddress(ref)
