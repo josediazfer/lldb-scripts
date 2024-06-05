@@ -165,6 +165,16 @@ def xrefs_from_ins(target, addr, start, end, refs):
                         section_start_addr = section.GetLoadAddress(target)
                         section_end_addr = section_start_addr + section.GetByteSize()
 
+def get_size_summary(size):
+    size_summary = ""
+
+    if size > 1024*1024:
+        size_summary = "%dM" % (size / (1024 * 1024))
+    else:
+        size_summary = "%db" % size
+
+    return size_summary
+
 def get_region_info_perms(region_info):
     region_perms = ""
     if region_info.IsReadable():
@@ -200,7 +210,8 @@ def xrefs_in_region(target, addr, refs, region_map):
     if (region_map['end'] - region_map['start']) > max_region_size:
         return
 
-    print("Searching in the memory region [0x%x-0x%x %s %d]" % (region_map['start'], region_map['end'], region_map['perms'], region_map['joined']))
+    print("Searching in the memory region [0x%x-0x%x %s %s %d]" %
+            (region_map['start'], region_map['end'], region_map['perms'], get_size_summary(region_map['end'] - region_map['start']), region_map['joined']))
     refs_count = do_xrefs_in_region(target, addr, refs, region_map)
     if refs_count > 0:
         print("\t* %d references found it" % refs_count)
