@@ -58,6 +58,11 @@ def do_xrefs_in_region(target, addr, refs, region_info):
     process = target.GetProcess()
     error = lldb.SBError()
     refs_count = len(refs)
+    if debug:
+        print("Scannig the memory region by memory pointer")
+
+    sections_region = get_sections_region(target, start, end, lldb.eSectionTypeInvalid)
+    region_scan_info = init_region_scan(target, sections_region)
     while start + addr_size <= end:
         ptr = process.ReadPointerFromMemory(start, error)
         if error.Success():
@@ -69,7 +74,11 @@ def do_xrefs_in_region(target, addr, refs, region_info):
         else:
             start += 1
 
+        start, ignore = next_addr_region_scan(target, start, sections_region, region_scan_info)
+
     if region_info['perms'].find('x') != -1:
+        if debug:
+            print("Scannig the memory region by instructions")
         start = region_info['start']
         xrefs_from_ins(target, addr, start, end, refs)
 
@@ -104,7 +113,7 @@ def resolve_branch_ref_addr(target, ins):
 
     return resolved_addr
 
-def xrefs_from_ins(target, addr, start, end, refs):
+def get_sections_region(target, start, end, section_type):
     sections_region = []
     module = target.ResolveLoadAddress(start).GetModule()
     for section in module.section_iter():
@@ -112,20 +121,61 @@ def xrefs_from_ins(target, addr, start, end, refs):
         if load_addr >= start and load_addr < end:
             if section.GetNumSubSections() > 0:
                 for subsection in section:
-                    if subsection.GetSectionType() == lldb.eSectionTypeCode:
+                    if section_type == lldb.eSectionTypeInvalid or subsection.GetSectionType() == section_type:
                         sections_region.append(subsection)
             else:
                 sections_region.append(section)
 
     sections_region.sort(key=lambda section : section.GetLoadAddress(target))
-    section_idx = 0
+
+    return sections_region
+
+def init_region_scan(target, sections_region):
+    region_scan_info = {}
+
     if len(sections_region) > 0:
         section = sections_region[0]
-        section_start_addr = section.GetLoadAddress(target)
-        section_end_addr = section_start_addr + section.GetByteSize()
-        section_idx = 0
+        region_scan_info['section'] = section
+        region_scan_info['section_start_addr'] = section.GetLoadAddress(target)
+        region_scan_info['section_end_addr'] = region_scan_info['section_start_addr'] + section.GetByteSize()
+        region_scan_info['section_current'] = None
+    else:
+        region_scan_info['section'] = None
 
-    section_current = None
+    region_scan_info['section_idx'] = 0
+
+    return region_scan_info
+
+
+def next_addr_region_scan(target, start, sections_region, region_scan_info):
+    if region_scan_info['section_idx'] < len(sections_region):
+        if start > region_scan_info['section_start_addr'] and not region_scan_info['section_current']:
+            section = region_scan_info['section']
+            start = region_scan_info['section_start_addr']
+            region_scan_info['section_current'] = section
+            if debug:
+                print("Starting search from %s section [0x%x-0x%x]" % (section.GetName(), start, region_scan_info['section_end_addr']))
+            return start, False
+
+        if start > region_scan_info['section_end_addr']:
+            region_scan_info['section_idx'] += 1
+            region_scan_info['section_current'] = None
+            start = region_scan_info['section_end_addr']
+            if debug:
+                print("Continue search from 0x%x" % (start))
+
+            if region_scan_info['section_idx'] < len(sections_region):
+                section = sections_region[region_scan_info['section_idx']]
+                region_scan_info['section'] = sections_region[region_scan_info['section_idx']]
+                region_scan_info['section_start_addr'] = section.GetLoadAddress(target)
+                region_scan_info['section_end_addr'] = region_scan_info['section_start_addr'] + section.GetByteSize()
+
+    return start, True
+
+def xrefs_from_ins(target, addr, start, end, refs):
+    sections_region = get_sections_region(target, start, end, lldb.eSectionTypeCode)
+    region_scan_info = init_region_scan(target, sections_region)
+
     while start < end: 
         dis_addr = target.ResolveLoadAddress(start)
         ins_dis = target.ReadInstructions(dis_addr, 10)
@@ -144,26 +194,9 @@ def xrefs_from_ins(target, addr, start, end, refs):
                 refs.add(start)
 
             start += ins.GetByteSize()
-            if section_idx < len(sections_region):
-                if start > section_start_addr and not section_current:
-                    start = section_start_addr
-                    section_current = section
-                    if debug:
-                        print("Starting search from %s section [0x%x-0x%x]" % (section.GetName(), start, section_end_addr))
-
-                    break
-
-                if start > section_end_addr:
-                    section_idx += 1
-                    section_current = None
-                    start = section_end_addr
-                    if debug:
-                        print("Continue search from 0x%x" % (start))
-
-                    if section_idx < len(sections_region):
-                        section = sections_region[section_idx]
-                        section_start_addr = section.GetLoadAddress(target)
-                        section_end_addr = section_start_addr + section.GetByteSize()
+            start, cont_ins_dis = next_addr_region_scan(target, start, sections_region, region_scan_info)
+            if not cont_ins_dis:
+                break
 
 def get_size_summary(size):
     size_summary = ""
@@ -205,8 +238,6 @@ def get_region_map(region_info):
 
 
 def xrefs_in_region(target, addr, refs, region_map):
-    global max_region_size
-
     if (region_map['end'] - region_map['start']) > max_region_size:
         return
 
@@ -232,7 +263,6 @@ def handle_command(debugger, command, exe_ctx, result, internal_dict):
     try:
         do_handle_command(debugger, command, exe_ctx, result, internal_dict, refs)
     except KeyboardInterrupt:
-        print("keyboard")
         None
 
     target = exe_ctx.target
@@ -241,11 +271,12 @@ def handle_command(debugger, command, exe_ctx, result, internal_dict):
     print("%d references count" % len(refs))
     for ref in refs:
         resol_addr = target.ResolveLoadAddress(ref)
-        print("\t* 0x%x %s" % (ref, resol_addr.section))
+        print("\t* 0x%x %s %s" % (ref, resol_addr.GetModule(), resol_addr.GetSection()))
 
 def do_handle_command(debugger, command, exe_ctx, result, internal_dict, refs):
     global pc_reg_name
     global debug
+    global max_region_size
 
     command_args = shlex.split(command, posix=False)
     usage = "usage: xref [options] expression"
